@@ -1,0 +1,124 @@
+name: docker-image
+
+# 一次性从本仓库源码构建 Docker 镜像，推到 Docker Hub。
+# 之后日常更新走面板「软件更新」的容器内替换，不需要再构建镜像。
+#
+# 触发：手动 Run workflow（可强制重建）。
+#
+# 一次性设置：
+#   1. Docker Hub → Account settings → Security → New Access Token（Read & Write）。
+#   2. 仓库 Settings → Secrets and variables → Actions → New repository secret：
+#        DOCKERHUB_USERNAME = wwz33
+#        DOCKERHUB_TOKEN    = 上一步的 token
+#      没配这两个 secret 时工作流只提示并跳过，不会报红。
+#
+# 产物：
+#   wwz33/agent2api:<版本>   例如 3.3.0-beta.5
+#   wwz33/agent2api:latest   始终指向最新构建
+#   wwz33/agent2api:beta     预发布版额外打这个 tag
+#
+# 架构：linux/amd64 + linux/arm64。Dockerfile 里 Rust 用 $BUILDPLATFORM
+# 原生编译 + aarch64 交叉工具链，arm64 只在运行时 apt 阶段走 QEMU。
+# 只要一种架构时改下面的 PLATFORMS。
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 强制重建（跳过“镜像已存在”判断）
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: wwz33/agent2api
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出本仓库默认分支
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: 读取版本并生成 tag
+        id: meta
+        run: |
+          set -euo pipefail
+          VERSION=$(jq -r .version package.json)
+          TAGS="${IMAGE}:${VERSION}
+          ${IMAGE}:latest"
+          if [[ "$VERSION" == *-* ]]; then
+            TAGS="${TAGS}
+          ${IMAGE}:beta"
+          fi
+          {
+            echo "version=$VERSION"
+            echo "tags<<EOF"
+            echo "$TAGS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "版本 $VERSION，tag："
+          echo "$TAGS"
+
+      - name: 检查 Docker Hub 凭据
+        id: creds
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "${DOCKERHUB_USERNAME:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "缺少 DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secret，跳过构建"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 设置 QEMU
+        if: steps.creds.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: 设置 Buildx
+        if: steps.creds.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v4
+
+      - name: 登录 Docker Hub
+        if: steps.creds.outputs.skip != 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 检查镜像是否已存在
+        id: exists
+        if: steps.creds.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          if [ "$FORCE" != "true" ] \
+             && docker manifest inspect "${IMAGE}:${VERSION}" >/dev/null 2>&1; then
+            echo "${IMAGE}:${VERSION} 已存在，跳过构建"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 构建并推送
+        if: steps.creds.outputs.skip != 'true' && steps.exists.outputs.skip != 'true'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
