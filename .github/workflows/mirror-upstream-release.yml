@@ -1,0 +1,210 @@
+name: mirror-upstream-release
+
+# 把上游 aimod-cc/Agent2API 最新 Release 的源码与 Linux 服务端更新包
+# 镜像到本仓库：源码提交到默认分支，同名 tag 的 Release 建在本仓库。
+#
+# 为什么需要：上游发版后 main 分支不再跟进，新源码只存在于 tag/Release 里
+# （main 停在 2026-10-16，v3.3.0-beta.5 的 tag 在 2026-10-29）。本仓库的
+# Docker 构建读的是本仓库源码，面板「检查更新」读的也是本仓库的 Release
+# 列表 —— 不镜像就永远停在旧版，且面板显示「已是最新」。
+#
+# 一次性设置：
+#   1. Settings → Actions → General → Workflow permissions
+#      选 "Read and write permissions"，否则推不上去、也建不了 Release。
+#   2. fork 仓库的定时任务默认关闭：到 Actions 页手动启用本工作流。
+#      公开仓库连续 60 天无活动时 GitHub 也会自动停用定时任务，届时重新启用。
+#   3. 面板要认本仓库的 Release：容器环境变量
+#      WORKBUDDY_UPDATE_REPO=<你的账号>/<本仓库名>
+#      不设则面板仍读上游默认源：源码镜像照常，更新下载走上游。
+#
+# 镜像范围：上游 Release 源码的全部文件，外加 Linux 服务端更新包
+# （agent2api-server-linux-{amd64,arm64}.tar.gz 与 .sha256）—— 面板的
+# 「下载并更新」只认这两个名字，缺了会退回「docker compose pull」提示。
+#
+# 保留项：.git/ 与 .github/workflows/ 不参与镜像，本工作流与你自己加的
+# 工作流不会被上游覆盖或删除。其余本地改动都会被上游源码覆盖，需要保留的
+# 文件加进下面 rsync 的 --exclude。
+#
+# 可选用仓库变量（Settings → Secrets and variables → Actions → Variables）：
+#   UPSTREAM_REPO       默认 aimod-cc/Agent2API
+#   INCLUDE_PRERELEASE  默认 true（同时镜像 beta；置 false 只跟正式版）
+#   MIRROR_BRANCH       默认仓库默认分支（Docker 构建换分支时一起改）
+#
+# 可选 secret：MIRROR_TOKEN —— 填一个有 repo 权限的 PAT 可让推送触发其它
+# 工作流；不填就用内置 GITHUB_TOKEN（推送不会触发其它工作流，够用）。
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: mirror-upstream-release
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'aimod-cc/Agent2API' }}
+  INCLUDE_PRERELEASE: ${{ vars.INCLUDE_PRERELEASE || 'true' }}
+  MIRROR_BRANCH: ${{ vars.MIRROR_BRANCH || github.event.repository.default_branch }}
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出本仓库目标分支
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.MIRROR_BRANCH }}
+          fetch-depth: 0
+
+      - name: 解析上游最新 Release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${UPSTREAM_REPO}/releases?per_page=100" > "$RUNNER_TEMP/releases.json"
+          TAG=$(python3 - "$RUNNER_TEMP/releases.json" "$INCLUDE_PRERELEASE" <<'PY'
+          import json
+          import sys
+
+          releases = json.load(open(sys.argv[1]))
+          include = sys.argv[2].strip().lower() == 'true'
+
+          def key(tag):
+              core, _, pre = tag.lstrip('vV').partition('-')
+              try:
+                  nums = tuple(int(part) for part in core.split('.'))
+              except ValueError:
+                  return None
+              nums += (0,) * (3 - len(nums))
+              if not pre:
+                  return (nums, 1, ())
+              ids = tuple((0, int(part)) if part.isdigit() else (1, part) for part in pre.split('.'))
+              return (nums, 0, ids)
+
+          candidates = [r for r in releases
+                        if not r.get('draft')
+                        and (include or not r.get('prerelease'))
+                        and key(r['tag_name']) is not None]
+          if not candidates:
+              sys.exit('没有匹配的 Release')
+          candidates.sort(key=lambda r: key(r['tag_name']))
+          print(candidates[-1]['tag_name'])
+          PY
+          )
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          gh release view "$TAG" --repo "$UPSTREAM_REPO" \
+            --json name,body,isPrerelease,assets > "$RUNNER_TEMP/upstream-release.json"
+
+          LOCAL_VERSION=$(python3 -c "import json;print(json.load(open('package.json'))['version'])")
+
+          # 不降级：INCLUDE_PRERELEASE=false 时上游正式版可能低于本地 beta，
+          # 照搬会把源码倒回旧版。
+          if python3 - "$LOCAL_VERSION" "${TAG#[vV]}" <<'PY'
+          import sys
+
+          def key(value):
+              core, _, pre = value.lstrip('vV').partition('-')
+              nums = tuple(int(part) for part in core.split('.'))
+              nums += (0,) * (3 - len(nums))
+              if not pre:
+                  return (nums, 1, ())
+              return (nums, 0, tuple((0, int(part)) if part.isdigit() else (1, part) for part in pre.split('.')))
+
+          sys.exit(0 if key(sys.argv[1]) > key(sys.argv[2]) else 1)
+          PY
+          then
+            echo "本地 $LOCAL_VERSION 高于上游 $TAG，不降级"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EXPECTED_ASSETS=$(jq -r '[.assets[].name | select(startswith("agent2api-server-linux-"))]
+            | sort | join(",")' "$RUNNER_TEMP/upstream-release.json")
+          LOCAL_ASSETS=""
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            LOCAL_ASSETS=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --json assets --jq '[.assets[].name | select(startswith("agent2api-server-linux-"))]
+                | sort | join(",")' 2>/dev/null || true)
+          fi
+          # 版本已同步且更新包资产名一一对应才算完成：上一次若只建了 Release
+          # 没传全更新包（上传中断），这里会重跑而不是跳过。
+          if [ "$LOCAL_VERSION" = "${TAG#[vV]}" ] && [ "$LOCAL_ASSETS" = "$EXPECTED_ASSETS" ]; then
+            echo "本仓库已有 $TAG，跳过镜像"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 同步上游源码到本仓库
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/src"
+          curl -fsSL "https://codeload.github.com/${UPSTREAM_REPO}/tar.gz/refs/tags/${TAG}" \
+            -o "$RUNNER_TEMP/src.tar.gz"
+          tar -xzf "$RUNNER_TEMP/src.tar.gz" -C "$RUNNER_TEMP/src" --strip-components=1
+
+          rsync -a --delete \
+            --exclude='.git/' \
+            --exclude='.github/workflows/' \
+            "$RUNNER_TEMP/src/" ./
+
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "源码与 $TAG 一致，无需提交"
+            exit 0
+          fi
+
+          git config user.name "${{ github.repository_owner }}"
+          git config user.email "${{ github.repository_owner }}@users.noreply.github.com"
+          git add -A
+          git commit -m "mirror: ${TAG} from ${UPSTREAM_REPO} [skip ci]"
+          git push origin "HEAD:${MIRROR_BRANCH}"
+
+      - name: 镜像 Release 与 Linux 更新包
+        if: steps.upstream.outputs.skip != 'true'
+        env:
+          TAG: ${{ steps.upstream.outputs.tag }}
+          GH_TOKEN: ${{ secrets.MIRROR_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mkdir -p "$RUNNER_TEMP/assets"
+          if gh release download "$TAG" --repo "$UPSTREAM_REPO" \
+               --pattern 'agent2api-server-linux-*' --dir "$RUNNER_TEMP/assets"; then
+            files=("$RUNNER_TEMP"/assets/*)
+          else
+            files=()
+            echo "上游该版本没有 Linux 服务端更新包，只镜像源码与 Release 元数据"
+          fi
+
+          TITLE=$(jq -r '.name // empty' "$RUNNER_TEMP/upstream-release.json")
+          [ -n "$TITLE" ] || TITLE="$TAG"
+          jq -r '.body // empty' "$RUNNER_TEMP/upstream-release.json" > "$RUNNER_TEMP/notes.md"
+          [ -s "$RUNNER_TEMP/notes.md" ] || printf '上游 %s\n' "$TAG" > "$RUNNER_TEMP/notes.md"
+
+          FLAG=()
+          if [ "$(jq -r '.isPrerelease' "$RUNNER_TEMP/upstream-release.json")" = "true" ] \
+             || [[ "$TAG" == *-* ]]; then
+            FLAG=(--prerelease)
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            if ((${#files[@]})); then
+              gh release upload "$TAG" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
+            fi
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$(git rev-parse HEAD)" \
+              --title "$TITLE" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              "${FLAG[@]}"
+          fi
