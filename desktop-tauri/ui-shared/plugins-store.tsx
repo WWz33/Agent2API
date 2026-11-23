@@ -22,10 +22,10 @@ export function PluginSettingsButton({ name, onClick, t }: { name: string; onCli
   </Button>
 }
 
-export function PluginGetButton({ disabled, onClick, t }: { disabled: boolean; onClick: () => void; t: PluginTranslate }) {
+export function PluginInstallButton({ disabled, onClick, t }: { disabled: boolean; onClick: () => void; t: PluginTranslate }) {
   return <Button variant='secondary' size='sm' disabled={disabled} onClick={onClick}
     className='rounded-sm border-primary-bd bg-primary-soft px-3 font-medium text-primary-fg hover:bg-primary-tint'>
-    {t('获取')}
+    {t('安装')}
   </Button>
 }
 
@@ -115,7 +115,7 @@ export function PluginStoreCard({ name, description, version, icon, artwork, hig
         {pending ? <Spinner className='size-3' /> : status !== 'missing' ? <StatusDot variant={running ? 'success' : failed ? 'warning' : 'muted'} /> : null}
         {statusText}
       </span>
-      {providerCount !== undefined ? <>
+      {providerCount !== undefined && providerCount > 1 ? <>
         <span className='opacity-40' aria-hidden='true'>·</span>
         <span className='tabular-nums'>{t('{count} 家提供商', {
           count: enabledCount === undefined ? providerCount : `${enabledCount}/${providerCount}`,
